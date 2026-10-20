@@ -1,63 +1,59 @@
-1. Write a Python command-line script named "RenameByDate.py" in this repository. The script should rename image files in a directory tree based on the date and time the image was captured, as stored in the image metadata.
+You are working in the repo root for the project "RenameByDate".
 
-2. Command-line interface:
-   - Accept exactly one required argument: the path to a directory to scan.
-   - Support the standard help flags: -h and --help.
-   - If the wrong number of arguments is supplied, print a usage message to stderr and exit with a non-zero status.
-   - If the supplied directory does not exist or is not readable, print an error to stderr and exit with a non-zero status.
+Create a Python command-line script named "RenameByDate.py" in this repository.
 
-3. Directory scan:
-   - Recursively scan the given directory tree.
-   - Process only image files.
-   - Ignore files that are not images and ignore directories.
-   - Treat common image file extensions such as .jpg, .jpeg, .png, .gif, .bmp, .tif, .tiff, .heic, .heif as valid image types.
-   - Do not use file modification time or directory timestamps as the source of the date; use the embedded image metadata only.
+Goal:
+Rename image files in a directory tree based on the date and time the image was captured, using the embedded metadata in the image file itself rather than filesystem timestamps.
 
-4. Metadata handling:
-   - Extract the capture date/time from the image metadata, not from the filesystem timestamp.
-   - Prefer EXIF fields such as DateTimeOriginal or DateTimeDigitized when available.
-   - If those are absent, fall back to other valid EXIF date metadata if available.
-   - If readable capture date/time metadata is not present, skip that file without renaming it.
-   - Ignore files whose metadata is unreadable or malformed.
+Requirements:
+1. The script must accept exactly one required argument: the path to a directory to scan.
+2. Support the standard help flags: -h and --help.
+3. If the wrong number of arguments is provided, print a usage message to stderr and exit with a non-zero status.
+4. If the directory does not exist or cannot be read, print an error to stderr and exit with a non-zero status.
+5. Recursively scan the provided directory tree.
+6. Process only image files. Ignore non-image files and directories.
+7. Treat common image extensions such as .jpg, .jpeg, .png, .gif, .bmp, .tif, .tiff, .heic, and .heif as valid image types.
+8. For each eligible image file, extract the capture date/time from embedded image metadata, not from the file's modification time or creation time.
+9. Prefer EXIF metadata fields such as DateTimeOriginal and DateTimeDigitized when available.
+10. If those fields are absent, fall back to other valid image metadata fields that indicate capture date/time, if available.
+11. If the file has no usable capture date/time metadata, skip it without renaming it.
+12. Ignore files whose metadata is unreadable, malformed, or missing.
+13. Rename each eligible file to a name that sorts chronologically when listed lexicographically.
+14. Use a naming format similar to: YYYY-MM-DD-HH-MM-SS.ext
+15. Preserve the original file extension, normalized to lowercase if appropriate.
+16. Example: IMG_1234.jpg -> 2024-05-12-14-32-18.jpg
+17. If a target filename would collide with an existing file, or with another file being renamed in the same run, print a clear error and skip that file without overwriting anything.
+18. Do not rename files when a collision would occur.
+19. If multiple files would resolve to the same target name, only one may be renamed; the others must be skipped with a collision error.
+20. Print a message indicating which directory is being scanned.
+21. At the end, print a summary line showing:
+    - total image files found
+    - number successfully renamed
+    - number skipped due to missing metadata
+    - number skipped due to collisions
+22. The script must be portable across Linux and Windows.
+23. Use only standard Python libraries.
+24. Avoid platform-specific path assumptions.
+25. Keep the code readable, maintainable, and well-factored.
+26. Include clear comments for each function and for any non-trivial logic.
+27. Do not add unnecessary temporary files or unnecessary abstraction layers.
 
-5. Renaming behavior:
-   - For each eligible image file, rename it to a filename that sorts chronologically when listed lexicographically.
-   - Use a format similar to: YYYY-MM-DD-HH-MM-SS.ext
-   - Preserve the original file extension, but normalize the extension to lowercase if appropriate.
-   - Example: IMG_1234.jpg -> 2024-05-12-14-32-18.jpg
-   - If the image file already has a name matching the target format, leave it unchanged unless it still needs to be renamed for consistency (this case should be handled conservatively and predictably).
-   - The script should operate in place; it should not create temporary copies or move files outside the source directory tree.
+Behavioral notes:
+- Use the embedded image metadata as the source of truth.
+- Do not rely on file creation or modification dates.
+- Do not rename files outside the scanned directory tree.
+- The script should modify files in place.
 
-6. Collision handling:
-   - Before renaming any file, check whether the target filename already exists in the target directory or would conflict with another file being renamed in the same run.
-   - If a collision would occur, print a clear error message to stderr and skip that file without renaming it.
-   - Do not overwrite existing files.
-   - If multiple source files would resolve to the same target name, only one may be renamed; the rest must be skipped with a collision error.
+Validation criteria:
+- The script runs successfully in Python on both Linux and Windows.
+- It scans directories recursively.
+- It renames valid files into a sortable time-based filename format.
+- It skips files with missing or unreadable metadata.
+- It avoids overwriting files and handles collisions safely.
+- It prints clear status and summary output.
+- It exits with non-zero status for invalid CLI usage or unreadable directories.
 
-7. Output:
-   - Print a message indicating which directory is being scanned.
-   - At the end, print a summary line reporting:
-     - the total number of image files found
-     - the number of files successfully renamed
-     - the number of files skipped due to missing metadata or collisions
-   - Use concise but informative messages for both success and error cases.
-
-8. Portability:
-   - The script must run on both Linux and Windows.
-   - Use only standard Python libraries.
-   - Avoid platform-specific assumptions about path separators or filename handling.
-
-9. Code quality:
-   - Include concise but clear comments for each function and for any non-trivial logic.
-   - Write readable, maintainable, and well-factored code.
-   - Keep logic explicit and avoid unnecessary temporary variables or unnecessary abstraction.
-
-10. Acceptance criteria:
-   - The script is executable as a Python CLI script.
-   - It scans the directory tree recursively.
-   - It reads capture metadata rather than filesystem timestamps.
-   - It renames valid files into a sortable chronological naming scheme.
-   - It skips unreadable or non-image files.
-   - It handles collisions safely.
-   - It prints clear status and summary output.
-   - It exits with the correct status codes for valid and invalid inputs.
+Important:
+- Ask for clarification only if a required behavior is genuinely ambiguous.
+- Otherwise, proceed with the implementation and make reasonable assumptions that align with the requirements above.
+- Favor correctness, clarity, and maintainability over cleverness.
