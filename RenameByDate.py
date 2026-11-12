@@ -70,25 +70,21 @@ def parse_capture_datetime(value):
 
 
 def read_capture_datetime(file_path):
-    """Read an embedded capture date from EXIF or other date/time metadata."""
+    """Return (capture datetime, parser error) from the image's embedded metadata."""
     if exifread is None:
-        return None
+        return None, "the exifread package is not installed"
 
     try:
         with file_path.open("rb") as image_file:
             tags = exifread.process_file(image_file, details=False)
-    except (OSError, ValueError, TypeError, struct_error()):
-        # The EXIF reader can reject truncated or malformed image metadata.
-        return None
-    except Exception:
-        # Metadata parser exceptions are treated as unreadable metadata, not fatal.
-        return None
+    except Exception as error:
+        # Include the path at the call site for any unreadable or malformed file.
+        return None, str(error) or error.__class__.__name__
 
     for tag_name in DATE_TAG_PRIORITY:
-        value = tags.get(tag_name)
-        capture_time = parse_capture_datetime(value)
+        capture_time = parse_capture_datetime(tags.get(tag_name))
         if capture_time is not None:
-            return capture_time
+            return capture_time, None
 
     # Some formats expose capture dates under other names. Only accept tags
     # explicitly suggesting a date/time, and never inspect file timestamps.
@@ -98,15 +94,9 @@ def read_capture_datetime(file_path):
             continue
         capture_time = parse_capture_datetime(value)
         if capture_time is not None:
-            return capture_time
+            return capture_time, None
 
-    return None
-
-
-def struct_error():
-    """Return a harmless exception class tuple member for parser compatibility."""
-    # Kept as a helper to avoid making the optional metadata dependency mandatory.
-    return OSError
+    return None, None
 
 
 def is_image_file(file_path):
@@ -117,20 +107,26 @@ def is_image_file(file_path):
         return False
 
 
-def find_image_files(directory):
-    """Recursively list supported image files, in a stable traversal order."""
+def find_files(directory):
+    """Collect every file and supported image below the directory in stable order."""
+    all_files = []
     image_files = []
 
     def report_walk_error(error):
-        print(f"Error: cannot read directory {error.filename}: {error}", file=sys.stderr)
+        failed_path = error.filename or directory
+        print(f"Error: cannot read directory {failed_path}: {error}", file=sys.stderr)
 
     for current, dirs, filenames in os.walk(directory, onerror=report_walk_error):
         dirs.sort()
         for filename in sorted(filenames):
             path = Path(current) / filename
+            # os.walk lists files separately from directories; count all such entries,
+            # while only supported regular files are passed to the metadata reader.
+            all_files.append(path)
             if is_image_file(path):
                 image_files.append(path)
-    return image_files
+
+    return all_files, image_files
 
 
 def build_target_path(source_path, capture_time):
@@ -155,11 +151,16 @@ def plan_renames(image_files, verbose):
         if verbose:
             print(f"Processing: {source_path}")
 
-        capture_time = read_capture_datetime(source_path)
+        capture_time, metadata_error = read_capture_datetime(source_path)
+        if metadata_error is not None:
+            # Parser errors are important even when verbose output is disabled.
+            print(f"Error: could not read metadata for {source_path}: {metadata_error}", file=sys.stderr)
+            missing_metadata += 1
+            continue
         if capture_time is None:
             missing_metadata += 1
             if verbose:
-                print("  Skipped: missing or unreadable capture metadata")
+                print(f"  Skipped: no usable capture metadata in {source_path}")
             continue
 
         target_path = build_target_path(source_path, capture_time)
@@ -168,15 +169,14 @@ def plan_renames(image_files, verbose):
 
         if source_key == target_key:
             if verbose:
-                print("  No change: filename already matches the capture timestamp")
+                print(f"  No change: {source_path} already matches the capture timestamp")
             continue
 
-        # Treat both existing files and destinations already claimed in this run
-        # as collisions; never overwrite a file, even if it is also being scanned.
+        # Treat existing files and destinations already claimed in this run as
+        # collisions; never overwrite a file.
         if target_path.exists() or target_key in reserved_targets:
             collisions += 1
-            if verbose:
-                print(f"  Skipped: collision at {target_path}")
+            print(f"Error: collision for file {source_path}: target already exists or is reserved: {target_path}", file=sys.stderr)
             continue
 
         reserved_targets.add(target_key)
@@ -188,6 +188,7 @@ def plan_renames(image_files, verbose):
 def perform_renames(candidates, dry_run, verbose):
     """Execute the rename plan or display it in dry-run mode."""
     renamed = 0
+    collisions = 0
 
     for source_path, target_path in candidates:
         if dry_run:
@@ -203,13 +204,39 @@ def perform_renames(candidates, dry_run, verbose):
                 raise FileExistsError(f"target already exists: {target_path}")
             os.rename(source_path, target_path)
         except OSError as error:
-            print(f"Error: collision; could not rename {source_path} to {target_path}: {error}", file=sys.stderr)
+            collisions += 1
+            print(
+                f"Error: could not rename file {source_path} to {target_path}: {error}",
+                file=sys.stderr,
+            )
         else:
             renamed += 1
             if verbose:
                 print(f"  Renamed: {source_path} -> {target_path}")
 
-    return renamed
+    return renamed, collisions
+
+
+def print_summary(total_files, total_images, renamed, missing_metadata, collisions):
+    """Print a compact two-column summary table for the completed scan."""
+    rows = (
+        ("Total files found", total_files),
+        ("Image files found", total_images),
+        ("Successfully renamed", renamed),
+        ("Skipped: missing metadata", missing_metadata),
+        ("Skipped: collisions", collisions),
+    )
+    label_width = max(len(label) for label, _ in rows)
+    count_width = max(len("Count"), max(len(str(count)) for _, count in rows))
+    separator = f"+{'-' * (label_width + 2)}+{'-' * (count_width + 2)}+"
+
+    print("Summary:")
+    print(separator)
+    print(f"| {'Item':<{label_width}} | {'Count':>{count_width}} |")
+    print(separator)
+    for label, count in rows:
+        print(f"| {label:<{label_width}} | {count:>{count_width}} |")
+    print(separator)
 
 
 def parse_args(argv=None):
@@ -246,15 +273,15 @@ def main(argv=None):
         return 1
 
     print(f"Scanning directory: {directory}")
-    image_files = find_image_files(directory)
-    candidates, missing_metadata, collisions = plan_renames(image_files, verbose)
-    renamed = perform_renames(candidates, args.dry_run, verbose)
-
-    print(
-        "Summary: total image files found={}, successfully renamed={}, "
-        "skipped missing metadata={}, skipped due to collisions={}".format(
-            len(image_files), renamed, missing_metadata, collisions
-        )
+    all_files, image_files = find_files(directory)
+    candidates, missing_metadata, planned_collisions = plan_renames(image_files, verbose)
+    renamed, runtime_collisions = perform_renames(candidates, args.dry_run, verbose)
+    print_summary(
+        total_files=len(all_files),
+        total_images=len(image_files),
+        renamed=renamed,
+        missing_metadata=missing_metadata,
+        collisions=planned_collisions + runtime_collisions,
     )
     return 0
 
