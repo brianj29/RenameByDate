@@ -78,7 +78,6 @@ def read_capture_datetime(file_path):
         with file_path.open("rb") as image_file:
             tags = exifread.process_file(image_file, details=False)
     except Exception as error:
-        # Include the path at the call site for any unreadable or malformed file.
         return None, str(error) or error.__class__.__name__
 
     for tag_name in DATE_TAG_PRIORITY:
@@ -107,8 +106,8 @@ def is_image_file(file_path):
         return False
 
 
-def find_files(directory):
-    """Collect every file and supported image below the directory in stable order."""
+def find_files(directory, verbose=False):
+    """Collect files and image files; in verbose mode report every file encountered."""
     all_files = []
     image_files = []
 
@@ -120,11 +119,13 @@ def find_files(directory):
         dirs.sort()
         for filename in sorted(filenames):
             path = Path(current) / filename
-            # os.walk lists files separately from directories; count all such entries,
-            # while only supported regular files are passed to the metadata reader.
             all_files.append(path)
             if is_image_file(path):
                 image_files.append(path)
+                if verbose:
+                    print(f"Found image file: {path}")
+            elif verbose:
+                print(f"Ignoring non-image file: {path}")
 
     return all_files, image_files
 
@@ -149,11 +150,10 @@ def plan_renames(image_files, verbose):
 
     for source_path in image_files:
         if verbose:
-            print(f"Processing: {source_path}")
+            print(f"Processing image: {source_path}")
 
         capture_time, metadata_error = read_capture_datetime(source_path)
         if metadata_error is not None:
-            # Parser errors are important even when verbose output is disabled.
             print(f"Error: could not read metadata for {source_path}: {metadata_error}", file=sys.stderr)
             missing_metadata += 1
             continue
@@ -251,7 +251,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
-        help="show the result for each image file",
+        help="show a status line for every file encountered",
     )
     return parser.parse_args(argv)
 
@@ -273,7 +273,7 @@ def main(argv=None):
         return 1
 
     print(f"Scanning directory: {directory}")
-    all_files, image_files = find_files(directory)
+    all_files, image_files = find_files(directory, verbose=verbose)
     candidates, missing_metadata, planned_collisions = plan_renames(image_files, verbose)
     renamed, runtime_collisions = perform_renames(candidates, args.dry_run, verbose)
     print_summary(
