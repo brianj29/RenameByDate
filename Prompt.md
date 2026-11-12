@@ -40,7 +40,7 @@ Requirements:
 27. Include clear comments for each function and for any non-trivial logic.
 28. Do not add unnecessary temporary files or unnecessary abstraction layers.
 29. Support a "-n" / "--dry-run" option which outputs the renames which would otherwise take place, but doesn't actually rename any files. "-n" implies "-v".
-30. Support a "-v" / "--verbose" option which outputs the name of each image file processed and either the new name it was given or the reason it was skipped.
+30. Support a "-v" / "--verbose" option which outputs the name of every file encountered, including non-image files, and reports the result for each image file processed.
 
 Behavioral notes:
 - Use the embedded image metadata as the source of truth.
@@ -48,6 +48,7 @@ Behavioral notes:
 - Do not rename files outside the scanned directory tree.
 - The script should modify files in place.
 - Non-image files are ignored for metadata and renaming, but are included in the total-files-found count.
+- In verbose mode, print an output line for every encountered file, including non-image files. For image files, report whether it was renamed, needs no change, or was skipped and why.
 - Use a simple readable table, rather than a single-line sentence, for the final summary.
 
 Validation criteria:
@@ -57,6 +58,7 @@ Validation criteria:
 - It skips files with missing or unreadable metadata.
 - It avoids overwriting files and handles collisions safely.
 - It prints clear status and a summary table with the total number of files, including non-images.
+- In verbose mode, every file encountered has an output line, including non-image files.
 - Any printed file-specific error includes the affected file name/path, including in non-verbose mode.
 - It correctly handles all required command line arguments.
 - It exits with non-zero status for invalid CLI usage or unreadable directories.
