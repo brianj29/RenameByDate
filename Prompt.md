@@ -32,11 +32,13 @@ Requirements:
     - number skipped due to missing metadata
     - number skipped due to collisions
 22. The script must be portable across Linux and Windows.
-23. Use only standard Python libraries.
+23. Use existing Python libraries for reading image metadata.  The exifread library from PyPI is recommended.
 24. Avoid platform-specific path assumptions.
 25. Keep the code readable, maintainable, and well-factored.
 26. Include clear comments for each function and for any non-trivial logic.
 27. Do not add unnecessary temporary files or unnecessary abstraction layers.
+28. Support a "-n" / "--dry-run" option which outputs the renames which would otherwise take place, but doesn't actually rename any files.  "-n" implies "-v".
+29. Support a "-v" / "--verbose" option which outputs the name of each file processed and either the new name it was given or the reason it was skipped.
 
 Behavioral notes:
 - Use the embedded image metadata as the source of truth.
@@ -51,6 +53,7 @@ Validation criteria:
 - It skips files with missing or unreadable metadata.
 - It avoids overwriting files and handles collisions safely.
 - It prints clear status and summary output.
+- It correctly handles all required command line arguments.
 - It exits with non-zero status for invalid CLI usage or unreadable directories.
 
 Important:
