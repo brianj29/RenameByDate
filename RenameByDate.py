@@ -1,377 +1,263 @@
 #!/usr/bin/env python3
-"""Rename image files based on their embedded capture timestamp."""
+"""Rename image files in a directory tree using embedded capture timestamps."""
 
 import argparse
 import os
-import struct
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import exifread
+except ImportError:  # Report a useful error when the command is run.
+    exifread = None
+
+
 VALID_EXTENSIONS = {
-    "jpg",
-    "jpeg",
-    "png",
-    "gif",
-    "bmp",
-    "tif",
-    "tiff",
-    "heic",
-    "heif",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".heif",
 }
 
-DATE_TIME_TAGS = (306, 36867, 36868)
+# Check the most specific and reliable EXIF capture fields before generic dates.
+DATE_TAG_PRIORITY = (
+    "EXIF DateTimeOriginal",
+    "EXIF DateTimeDigitized",
+    "Image DateTime",
+)
+DATE_FORMATS = (
+    "%Y:%m:%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+)
 
 
-def parse_args():
-    """Create and parse the command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description=(
-            "Rename image files in a directory tree using the capture date stored in "
-            "their embedded metadata."
-        )
-    )
-    parser.add_argument("directory", help="Directory tree to scan for image files.")
-    return parser.parse_args()
-
-
-def normalize_extension(path):
-    """Return the file extension in lowercase without the leading dot."""
-    return path.suffix.lower().lstrip(".")
-
-
-def read_u16(data, offset, little_endian):
-    """Read a 16-bit unsigned integer from a byte buffer."""
-    if offset + 2 > len(data):
-        raise ValueError("Unexpected end of data while reading UINT16")
-    fmt = "<H" if little_endian else ">H"
-    return struct.unpack_from(fmt, data, offset)[0]
-
-
-def read_u32(data, offset, little_endian):
-    """Read a 32-bit unsigned integer from a byte buffer."""
-    if offset + 4 > len(data):
-        raise ValueError("Unexpected end of data while reading UINT32")
-    fmt = "<I" if little_endian else ">I"
-    return struct.unpack_from(fmt, data, offset)[0]
-
-
-def decode_tiff_value(data, entry_offset, data_type, count, value_or_offset, little_endian):
-    """Decode a TIFF/EXIF tag value from the field data."""
-    type_sizes = {
-        1: 1,
-        2: 1,
-        3: 2,
-        4: 4,
-        5: 8,
-        7: 1,
-        9: 4,
-        10: 8,
-    }
-
-    size = type_sizes.get(data_type)
-    if size is None:
-        return None
-
-    total_size = count * size
-    if total_size <= 4:
-        raw = data[entry_offset + 8 : entry_offset + 8 + total_size]
-        if len(raw) < total_size:
-            raw = raw.ljust(total_size, b"\x00")
-    else:
-        if value_or_offset + total_size > len(data):
-            return None
-        raw = data[value_or_offset : value_or_offset + total_size]
-
-    if data_type == 2:
-        return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
-
-    if data_type == 3:
-        values = [read_u16(raw, idx * 2, little_endian) for idx in range(count)]
-        return values[0] if count == 1 else values
-
-    if data_type == 4:
-        values = [read_u32(raw, idx * 4, little_endian) for idx in range(count)]
-        return values[0] if count == 1 else values
-
-    if data_type == 5:
-        values = []
-        for idx in range(count):
-            pos = idx * 8
-            numerator = read_u32(raw, pos, little_endian)
-            denominator = read_u32(raw, pos + 4, little_endian)
-            values.append((numerator, denominator))
-        return values[0] if count == 1 else values
-
-    if data_type in (1, 7):
-        return raw[:count] if count == 1 else raw
-
-    return None
-
-
-def parse_ifd(data, ifd_offset, little_endian):
-    """Parse a TIFF IFD and return a dictionary of tag values."""
-    if ifd_offset < 0 or ifd_offset + 2 > len(data):
-        return {}
-
-    entry_count = read_u16(data, ifd_offset, little_endian)
-    tags = {}
-
-    for i in range(entry_count):
-        entry_offset = ifd_offset + 2 + (i * 12)
-        if entry_offset + 12 > len(data):
-            break
-
-        tag = read_u16(data, entry_offset, little_endian)
-        data_type = read_u16(data, entry_offset + 2, little_endian)
-        count = read_u32(data, entry_offset + 4, little_endian)
-        value_or_offset = read_u32(data, entry_offset + 8, little_endian)
-        value = decode_tiff_value(data, entry_offset, data_type, count, value_or_offset, little_endian)
-        tags[tag] = value
-
-    next_ifd_offset = ifd_offset + 2 + (entry_count * 12)
-    if next_ifd_offset + 4 <= len(data):
-        next_ifd = read_u32(data, next_ifd_offset, little_endian)
-        if next_ifd != 0:
-            tags["__next_ifd__"] = next_ifd
-
-    return tags
-
-
-def normalize_capture_value(value):
-    """Normalize EXIF date strings into a standard datetime string."""
+def parse_capture_datetime(value):
+    """Parse a metadata date value without consulting filesystem timestamps."""
     if value is None:
         return None
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        value = value[0]
 
-    if not isinstance(value, str):
-        value = str(value)
-
-    cleaned = value.strip().replace("\x00", "").strip()
-    if not cleaned:
+    # EXIF values can contain null padding, fractional seconds, or a UTC offset.
+    text = str(value).strip().replace("\x00", "").strip()
+    if not text:
         return None
 
-    for fmt in (
-        "%Y:%m:%d %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-    ):
-        try:
-            return datetime.strptime(cleaned, fmt)
-        except ValueError:
+    for candidate in (text, re.split(r"[+-]\d{2}:?\d{2}$", text)[0].strip()):
+        for date_format in DATE_FORMATS:
+            try:
+                return datetime.strptime(candidate, date_format)
+            except ValueError:
+                pass
+
+    # EXIF subsecond and offset tags are sometimes appended to the base timestamp.
+    match = re.match(r"^(\d{4}[:/-]\d{2}[:/-]\d{2} \d{2}:\d{2}:\d{2})", text)
+    if match:
+        for date_format in DATE_FORMATS[:3]:
+            try:
+                return datetime.strptime(match.group(1), date_format)
+            except ValueError:
+                pass
+    return None
+
+
+def read_capture_datetime(file_path):
+    """Read an embedded capture date from EXIF or other date/time metadata."""
+    if exifread is None:
+        return None
+
+    try:
+        with file_path.open("rb") as image_file:
+            tags = exifread.process_file(image_file, details=False)
+    except (OSError, ValueError, TypeError, struct_error()):
+        # The EXIF reader can reject truncated or malformed image metadata.
+        return None
+    except Exception:
+        # Metadata parser exceptions are treated as unreadable metadata, not fatal.
+        return None
+
+    for tag_name in DATE_TAG_PRIORITY:
+        value = tags.get(tag_name)
+        capture_time = parse_capture_datetime(value)
+        if capture_time is not None:
+            return capture_time
+
+    # Some formats expose capture dates under other names. Only accept tags
+    # explicitly suggesting a date/time, and never inspect file timestamps.
+    for tag_name, value in tags.items():
+        name = str(tag_name).lower()
+        if "date" not in name and "time" not in name:
+            continue
+        capture_time = parse_capture_datetime(value)
+        if capture_time is not None:
+            return capture_time
+
+    return None
+
+
+def struct_error():
+    """Return a harmless exception class tuple member for parser compatibility."""
+    # Kept as a helper to avoid making the optional metadata dependency mandatory.
+    return OSError
+
+
+def is_image_file(file_path):
+    """Return whether the path is a regular file with a supported extension."""
+    try:
+        return file_path.is_file() and file_path.suffix.lower() in VALID_EXTENSIONS
+    except OSError:
+        return False
+
+
+def find_image_files(directory):
+    """Recursively list supported image files, in a stable traversal order."""
+    image_files = []
+
+    def report_walk_error(error):
+        print(f"Error: cannot read directory {error.filename}: {error}", file=sys.stderr)
+
+    for current, dirs, filenames in os.walk(directory, onerror=report_walk_error):
+        dirs.sort()
+        for filename in sorted(filenames):
+            path = Path(current) / filename
+            if is_image_file(path):
+                image_files.append(path)
+    return image_files
+
+
+def build_target_path(source_path, capture_time):
+    """Create a chronological target filename in the source file's directory."""
+    timestamp = capture_time.strftime("%Y-%m-%d-%H-%M-%S")
+    return source_path.with_name(timestamp + source_path.suffix.lower())
+
+
+def normalized_path(path):
+    """Return a platform-normalized absolute path for collision comparisons."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def plan_renames(image_files, verbose):
+    """Build rename candidates and classify files without changing the filesystem."""
+    candidates = []
+    missing_metadata = 0
+    collisions = 0
+    reserved_targets = set()
+
+    for source_path in image_files:
+        if verbose:
+            print(f"Processing: {source_path}")
+
+        capture_time = read_capture_datetime(source_path)
+        if capture_time is None:
+            missing_metadata += 1
+            if verbose:
+                print("  Skipped: missing or unreadable capture metadata")
             continue
 
-    return None
+        target_path = build_target_path(source_path, capture_time)
+        source_key = normalized_path(source_path)
+        target_key = normalized_path(target_path)
+
+        if source_key == target_key:
+            if verbose:
+                print("  No change: filename already matches the capture timestamp")
+            continue
+
+        # Treat both existing files and destinations already claimed in this run
+        # as collisions; never overwrite a file, even if it is also being scanned.
+        if target_path.exists() or target_key in reserved_targets:
+            collisions += 1
+            if verbose:
+                print(f"  Skipped: collision at {target_path}")
+            continue
+
+        reserved_targets.add(target_key)
+        candidates.append((source_path, target_path))
+
+    return candidates, missing_metadata, collisions
 
 
-def parse_exif_from_tiff(data):
-    """Read EXIF date tags from TIFF-derived EXIF data."""
-    if len(data) < 8:
-        return None
+def perform_renames(candidates, dry_run, verbose):
+    """Execute the rename plan or display it in dry-run mode."""
+    renamed = 0
 
-    byte_order = data[:2]
-    if byte_order == b"II":
-        little_endian = True
-    elif byte_order == b"MM":
-        little_endian = False
-    else:
-        return None
+    for source_path, target_path in candidates:
+        if dry_run:
+            renamed += 1
+            if verbose:
+                print(f"  Would rename: {source_path} -> {target_path}")
+            continue
 
-    try:
-        if read_u16(data, 2, little_endian) != 42:
-            return None
-    except ValueError:
-        return None
+        try:
+            # Recheck immediately before the operation to reduce the chance of
+            # replacing a file created after planning. os.rename is same-directory.
+            if target_path.exists():
+                raise FileExistsError(f"target already exists: {target_path}")
+            os.rename(source_path, target_path)
+        except OSError as error:
+            print(f"Error: collision; could not rename {source_path} to {target_path}: {error}", file=sys.stderr)
+        else:
+            renamed += 1
+            if verbose:
+                print(f"  Renamed: {source_path} -> {target_path}")
 
-    try:
-        first_ifd_offset = read_u32(data, 4, little_endian)
-    except ValueError:
-        return None
-
-    if first_ifd_offset < 8 or first_ifd_offset >= len(data):
-        return None
-
-    first_ifd = parse_ifd(data, first_ifd_offset, little_endian)
-    if not first_ifd:
-        return None
-
-    candidate_values = []
-    for tag in DATE_TIME_TAGS:
-        if tag in first_ifd:
-            candidate_values.append(normalize_capture_value(first_ifd[tag]))
-
-    exif_ifd_offset = first_ifd.get(0x8769)
-    if isinstance(exif_ifd_offset, (int, float)):
-        exif_ifd = parse_ifd(data, int(exif_ifd_offset), little_endian)
-        for tag in DATE_TIME_TAGS:
-            if tag in exif_ifd:
-                candidate_values.append(normalize_capture_value(exif_ifd[tag]))
-
-    for value in candidate_values:
-        if value is not None:
-            return value
-
-    return None
+    return renamed
 
 
-def extract_capture_datetime(path):
-    """Extract the image capture datetime from embedded metadata if available."""
-    try:
-        with open(path, "rb") as handle:
-            content = handle.read()
-    except OSError:
-        return None
-
-    if not content:
-        return None
-
-    # JPEG files store EXIF data in APP1 segments after the SOI marker.
-    if content.startswith(b"\xFF\xD8"):
-        offset = 2
-        while offset + 4 <= len(content):
-            if content[offset] != 0xFF:
-                break
-            marker = content[offset + 1]
-            if marker == 0xD9:
-                break
-            if marker == 0xDA:
-                break
-
-            if offset + 4 > len(content):
-                break
-            segment_length = (content[offset + 2] << 8) | content[offset + 3]
-            if segment_length < 2:
-                break
-
-            segment_start = offset + 4
-            segment_end = segment_start + segment_length - 2
-            if segment_end > len(content):
-                break
-
-            if marker == 0xE1 and content[segment_start : segment_start + 6] == b"Exif\x00\x00":
-                exif_data = content[segment_start + 6 : segment_end]
-                dt = parse_exif_from_tiff(exif_data)
-                if dt is not None:
-                    return dt
-
-            offset = segment_end + 2
-
-        return None
-
-    # PNG EXIF data is stored in an eXIf chunk.
-    if content.startswith(b"\x89PNG\r\n\x1a\n"):
-        offset = 8
-        while offset + 8 <= len(content):
-            chunk_length = struct.unpack(">I", content[offset : offset + 4])[0]
-            chunk_type = content[offset + 4 : offset + 8]
-            chunk_data_start = offset + 8
-            chunk_data_end = chunk_data_start + chunk_length
-            if chunk_data_end + 4 > len(content):
-                break
-
-            if chunk_type == b"eXIf":
-                dt = parse_exif_from_tiff(content[chunk_data_start : chunk_data_end])
-                if dt is not None:
-                    return dt
-
-            offset = chunk_data_end + 4
-
-        return None
-
-    # TIFF and TIFF-based formats store tags directly in the file header.
-    if content[:2] in (b"II", b"MM"):
-        return parse_exif_from_tiff(content)
-
-    return None
+def parse_args(argv=None):
+    """Define and parse the command-line options."""
+    parser = argparse.ArgumentParser(
+        description="Rename images using their embedded capture date and time."
+    )
+    parser.add_argument("directory", help="directory tree to scan recursively")
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="show planned renames without changing files (implies --verbose)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="show the result for each image file",
+    )
+    return parser.parse_args(argv)
 
 
-def iter_image_files(root_path):
-    """Yield valid image files under the provided directory tree."""
-    for current, _, files in os.walk(root_path, topdown=True):
-        for name in files:
-            file_path = Path(current) / name
-            if normalize_extension(file_path) in VALID_EXTENSIONS:
-                yield file_path
-
-
-def build_target_name(capture_datetime, original_path):
-    """Generate a timestamp-based filename while preserving the original extension."""
-    extension = original_path.suffix.lower()
-    timestamp = capture_datetime.strftime("%Y-%m-%d-%H-%M-%S")
-    return f"{timestamp}{extension}"
-
-
-def main(argv):
-    """Run the CLI program."""
-    args = parse_args()
-    directory = Path(args.directory)
+def main(argv=None):
+    """Validate arguments and run the recursive image renamer."""
+    args = parse_args(argv)
+    verbose = args.verbose or args.dry_run
+    directory = Path(args.directory).expanduser()
 
     if not directory.exists() or not directory.is_dir():
         print(f"Error: directory does not exist or is not a directory: {directory}", file=sys.stderr)
         return 1
-
     if not os.access(directory, os.R_OK):
         print(f"Error: directory is not readable: {directory}", file=sys.stderr)
         return 1
+    if exifread is None:
+        print("Error: install the required metadata reader with: pip install exifread", file=sys.stderr)
+        return 1
 
     print(f"Scanning directory: {directory}")
-
-    total_image_files = 0
-    renamed_count = 0
-    metadata_missing_count = 0
-    collision_count = 0
-    reserved_targets = set()
-
-    for image_path in iter_image_files(directory):
-        total_image_files += 1
-        capture_datetime = extract_capture_datetime(image_path)
-
-        if capture_datetime is None:
-            print(f"Skipping file with missing or unreadable metadata: {image_path}")
-            metadata_missing_count += 1
-            continue
-
-        target_name = build_target_name(capture_datetime, image_path)
-        target_path = image_path.with_name(target_name)
-        target_key = os.path.normcase(os.path.normpath(str(target_path)))
-
-        if target_path == image_path:
-            print(f"No rename needed for file: {image_path}")
-            continue
-
-        if target_path.exists() or target_key in reserved_targets:
-            print(f"Collision detected; skipping file: {image_path} -> {target_path}")
-            collision_count += 1
-            continue
-
-        reserved_targets.add(target_key)
-        try:
-            os.rename(image_path, target_path)
-        except OSError:
-            print(f"Collision detected; skipping file: {image_path} -> {target_path}")
-            collision_count += 1
-            reserved_targets.discard(target_key)
-            continue
-
-        print(f"Renamed: {image_path} -> {target_path}")
-        renamed_count += 1
+    image_files = find_image_files(directory)
+    candidates, missing_metadata, collisions = plan_renames(image_files, verbose)
+    renamed = perform_renames(candidates, args.dry_run, verbose)
 
     print(
-        "Summary: "
-        f"total image files found={total_image_files}, "
-        f"successfully renamed={renamed_count}, "
-        f"skipped missing metadata={metadata_missing_count}, "
-        f"skipped collisions={collision_count}"
+        "Summary: total image files found={}, successfully renamed={}, "
+        "skipped missing metadata={}, skipped due to collisions={}".format(
+            len(image_files), renamed, missing_metadata, collisions
+        )
     )
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main(sys.argv))
-    except KeyboardInterrupt:
-        print("Interrupted by user.", file=sys.stderr)
-        raise SystemExit(1)
+    sys.exit(main())
